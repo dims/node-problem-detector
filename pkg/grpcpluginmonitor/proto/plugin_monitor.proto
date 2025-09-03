@@ -1,0 +1,122 @@
+/*
+Copyright 2024 The Kubernetes Authors All rights reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+syntax = "proto3";
+
+package grpcpluginmonitor;
+option go_package = "k8s.io/node-problem-detector/pkg/grpcpluginmonitor/proto";
+
+import "google/protobuf/timestamp.proto";
+
+// ProblemType represents the type of problem detected
+enum ProblemType {
+  PERMANENT = 0;  // Changes node condition
+  TEMPORARY = 1;  // Generates event only
+}
+
+// ProblemStatus represents the status of the problem
+enum ProblemStatus {
+  OK = 0;       // No problem detected
+  WARNING = 1;  // Problem detected
+  UNKNOWN = 2;  // Unable to determine status
+}
+
+// ProblemSeverity represents the severity level
+enum ProblemSeverity {
+  INFO = 0;
+  WARN = 1;
+  ERROR = 2;
+}
+
+// ProblemReport represents a single problem detected by the client
+message ProblemReport {
+  // Type of problem (permanent affects node condition, temporary generates event)
+  ProblemType type = 1;
+  
+  // Condition name for permanent problems (e.g., "NetworkProblem", "DiskPressure")
+  string condition = 2;
+  
+  // Short reason identifier (e.g., "NetworkDown", "DiskFull")
+  string reason = 3;
+  
+  // Human-readable message describing the problem
+  string message = 4;
+  
+  // Status of the problem
+  ProblemStatus status = 5;
+  
+  // Severity level for events
+  ProblemSeverity severity = 6;
+  
+  // Timestamp when the problem was detected
+  google.protobuf.Timestamp timestamp = 7;
+  
+  // Additional metadata about the problem
+  map<string, string> metadata = 8;
+}
+
+// ReportProblemsRequest contains one or more problem reports
+message ReportProblemsRequest {
+  // Source identifier for the reporting client
+  string source = 1;
+  
+  // List of problems to report
+  repeated ProblemReport problems = 2;
+  
+  // Client version for compatibility tracking
+  string client_version = 3;
+}
+
+// ReportProblemsResponse contains the server's response
+message ReportProblemsResponse {
+  // Whether the request was processed successfully
+  bool success = 1;
+  
+  // Error message if success is false
+  string error_message = 2;
+  
+  // Number of problems processed
+  int32 processed_count = 3;
+  
+  // Server processing timestamp
+  google.protobuf.Timestamp processed_at = 4;
+}
+
+// HealthCheckRequest for monitoring server health
+message HealthCheckRequest {
+  string service = 1;
+}
+
+// HealthCheckResponse with server health status
+message HealthCheckResponse {
+  enum ServingStatus {
+    UNKNOWN = 0;
+    SERVING = 1;
+    NOT_SERVING = 2;
+  }
+  
+  ServingStatus status = 1;
+  string message = 2;
+}
+
+// ProblemMonitorService defines the service interface
+service ProblemMonitorService {
+  // Report problems to the node problem detector
+  rpc ReportProblems(ReportProblemsRequest) returns (ReportProblemsResponse);
+  
+  // Health check endpoint
+  rpc Check(HealthCheckRequest) returns (HealthCheckResponse);
+}

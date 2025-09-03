@@ -19,7 +19,8 @@
         build-binaries build-container build-tar build \
         docker-builder build-in-docker \
         push-container push-tar push release clean depup \
-        print-tar-sha-md5
+        print-tar-sha-md5 \
+        proto proto-clean grpc-example install-proto-tools
 
 all: build
 
@@ -142,6 +143,7 @@ BINARIES_LINUX_ONLY =
 ifeq ($(ENABLE_JOURNALD), 1)
 	BINARIES_LINUX_ONLY += bin/log-counter
 endif
+BINARIES_EXAMPLES = examples/bin/grpc-plugin-client
 
 ALL_BINARIES = $(foreach binary, $(BINARIES) $(BINARIES_LINUX_ONLY), ./$(binary)) \
   $(foreach platform, $(LINUX_PLATFORMS), $(foreach binary, $(BINARIES) $(BINARIES_LINUX_ONLY), output/$(platform)/$(binary))) \
@@ -302,9 +304,14 @@ coverage.out:
 clean:
 	rm -rf bin/
 	rm -rf test/bin/
+	rm -rf examples/bin/
+	rm -f examples/grpc-plugin-client/grpc-client
 	rm -f node-problem-detector-*.tar.gz*
 	rm -rf output/
 	rm -f coverage.out
+	rm -f **/*.test 2>/dev/null || true
+	@echo "Cleaning GRPC protobuf files..."
+	cd pkg/grpcpluginmonitor && $(MAKE) clean 2>/dev/null || true
 
 .PHONY: gomod
 gomod:
@@ -318,3 +325,64 @@ goget:
 
 .PHONY: depup
 depup: goget gomod
+
+# Protobuf generation for GRPC Plugin Monitor
+.PHONY: proto
+proto:
+	@echo "Generating protobuf files for GRPC Plugin Monitor..."
+	@command -v protoc >/dev/null 2>&1 || { echo "protoc is not installed. Run 'make install-proto-tools' first."; exit 1; }
+	@command -v protoc-gen-go >/dev/null 2>&1 || { echo "protoc-gen-go is not installed. Run 'make install-proto-tools' first."; exit 1; }
+	@command -v protoc-gen-go-grpc >/dev/null 2>&1 || { echo "protoc-gen-go-grpc is not installed. Run 'make install-proto-tools' first."; exit 1; }
+	cd pkg/grpcpluginmonitor && $(MAKE) proto
+
+.PHONY: proto-clean
+proto-clean:
+	@echo "Cleaning generated protobuf files..."
+	cd pkg/grpcpluginmonitor && $(MAKE) clean
+
+.PHONY: install-proto-tools
+install-proto-tools:
+	@echo "Installing protobuf tools..."
+	go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
+	go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
+	@echo "Note: You also need to install protoc compiler:"
+	@echo "  - On macOS: brew install protobuf"
+	@echo "  - On Ubuntu: sudo apt-get install protobuf-compiler"
+	@echo "  - On RHEL/CentOS: sudo yum install protobuf-compiler"
+
+# Build GRPC example client
+./examples/bin/grpc-plugin-client: $(PKG_SOURCES)
+	@mkdir -p examples/bin
+	cd examples/grpc-plugin-client && \
+	CGO_ENABLED=0 go build -o ../../examples/bin/grpc-plugin-client .
+
+.PHONY: grpc-example
+grpc-example: ./examples/bin/grpc-plugin-client
+
+# Enhanced test target that includes GRPC Plugin Monitor tests
+.PHONY: test-grpc
+test-grpc:
+	@echo "Running GRPC Plugin Monitor tests..."
+	go test -timeout=1m -v -race -short -tags "$(HOST_PLATFORM_BUILD_TAGS)" ./pkg/grpcpluginmonitor/...
+
+# Build target that ensures protobuf files are generated
+build-with-grpc: proto build
+
+# Test build with GRPC plugin monitor disabled
+.PHONY: test-build-no-grpc
+test-build-no-grpc:
+	@echo "Testing build with GRPC Plugin Monitor disabled..."
+	CGO_ENABLED=$(CGO_ENABLED) go build \
+		-tags "$(HOST_PLATFORM_BUILD_TAGS) disable_grpc_plugin_monitor" \
+		-ldflags '-X $(PKG)/pkg/version.version=$(VERSION)' \
+		./cmd/nodeproblemdetector
+
+# Comprehensive build test (lightweight)
+.PHONY: test-builds
+test-builds: test-build-no-grpc grpc-example ./bin/node-problem-detector
+	@echo "All build tests completed successfully!"
+
+# Full comprehensive build test including containers
+.PHONY: test-all-builds
+test-all-builds: test-build-no-grpc build grpc-example
+	@echo "All comprehensive build tests completed successfully!"

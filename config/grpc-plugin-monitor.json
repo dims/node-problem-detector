@@ -1,0 +1,31 @@
+{
+  "source": "custom-grpc-plugin-monitor",
+  "socket_path": "/var/run/node-problem-detector/grpc-plugin-monitor.sock",
+  "tls": {
+    "enabled": true,
+    "cert_file": "/etc/node-problem-detector/certs/server.crt",
+    "key_file": "/etc/node-problem-detector/certs/server.key",
+    "ca_file": "/etc/node-problem-detector/certs/ca.crt",
+    "require_client_cert": true
+  },
+  "metrics_reporting": true,
+  "skip_initial_status": false,
+  "enable_message_change_based_condition_update": false,
+  "conditions": [
+    {
+      "type": "CustomApplicationProblem",
+      "reason": "CustomApplicationHealthy",
+      "message": "custom application is running normally"
+    },
+    {
+      "type": "DatabaseConnectivityProblem",
+      "reason": "DatabaseConnectivityNormal",
+      "message": "database connectivity is normal"
+    },
+    {
+      "type": "ExternalServiceProblem",
+      "reason": "ExternalServiceHealthy",
+      "message": "external service dependencies are healthy"
+    }
+  ]
+}
