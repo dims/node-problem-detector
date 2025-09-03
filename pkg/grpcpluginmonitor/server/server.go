@@ -24,11 +24,16 @@ import (
 	"net"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	grpc_prometheus "github.com/grpc-ecosystem/go-grpc-prometheus"
+	"github.com/prometheus/client_golang/prometheus"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/health"
+	"google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
 	"k8s.io/klog/v2"
@@ -39,24 +44,43 @@ import (
 	"k8s.io/node-problem-detector/pkg/util/tomb"
 )
 
+var requestID int64
+
 // ProblemMonitorServer implements the GRPC ProblemMonitorService
 type ProblemMonitorServer struct {
 	pb.UnimplementedProblemMonitorServiceServer
-	config     gpmtypes.GRPCPluginConfig
-	resultChan chan gpmtypes.Result
-	grpcServer *grpc.Server
-	tomb       *tomb.Tomb
-	mu         sync.RWMutex
-	serving    bool
+	config        gpmtypes.GRPCPluginConfig
+	resultChan    chan gpmtypes.Result
+	grpcServer    *grpc.Server
+	healthServer  *health.Server
+	serverMetrics *grpc_prometheus.ServerMetrics
+	tomb          *tomb.Tomb
+	mu            sync.RWMutex
+	serving       bool
 }
 
 // NewProblemMonitorServer creates a new GRPC problem monitor server
 func NewProblemMonitorServer(config gpmtypes.GRPCPluginConfig, resultChan chan gpmtypes.Result) *ProblemMonitorServer {
+	// Initialize server metrics
+	serverMetrics := grpc_prometheus.NewServerMetrics()
+	
+	// Register metrics with prometheus
+	err := prometheus.Register(serverMetrics)
+	if err != nil {
+		klog.Warningf("Failed to register GRPC metrics: %v", err)
+	}
+	
+	// Initialize health server
+	healthServer := health.NewServer()
+	healthServer.SetServingStatus("grpc.plugin.monitor", grpc_health_v1.HealthCheckResponse_SERVING)
+	
 	return &ProblemMonitorServer{
-		config:     config,
-		resultChan: resultChan,
-		tomb:       tomb.NewTomb(),
-		serving:    false,
+		config:        config,
+		resultChan:    resultChan,
+		serverMetrics: serverMetrics,
+		healthServer:  healthServer,
+		tomb:          tomb.NewTomb(),
+		serving:       false,
 	}
 }
 
@@ -96,8 +120,33 @@ func (s *ProblemMonitorServer) Start() error {
 		klog.Info("GRPC server configured with TLS")
 	}
 
+	// Setup interceptor chains following Kubernetes patterns
+	chainUnaryInterceptors := []grpc.UnaryServerInterceptor{
+		s.unaryLoggingInterceptor,
+		s.serverMetrics.UnaryServerInterceptor(),
+	}
+
+	chainStreamInterceptors := []grpc.StreamServerInterceptor{
+		s.streamLoggingInterceptor,
+		s.serverMetrics.StreamServerInterceptor(),
+	}
+
+	opts = append(opts, grpc.ChainUnaryInterceptor(chainUnaryInterceptors...))
+	opts = append(opts, grpc.ChainStreamInterceptor(chainStreamInterceptors...))
+
+	// Set message size limits following etcd patterns
+	opts = append(opts, grpc.MaxRecvMsgSize(4*1024*1024))  // 4MB
+	opts = append(opts, grpc.MaxSendMsgSize(4*1024*1024))  // 4MB
+	opts = append(opts, grpc.MaxConcurrentStreams(1000))
+
 	s.grpcServer = grpc.NewServer(opts...)
+	
+	// Register services
 	pb.RegisterProblemMonitorServiceServer(s.grpcServer, s)
+	grpc_health_v1.RegisterHealthServer(s.grpcServer, s.healthServer)
+
+	// Initialize metrics for registered server
+	s.serverMetrics.InitializeMetrics(s.grpcServer)
 
 	s.mu.Lock()
 	s.serving = true
@@ -273,4 +322,85 @@ func (s *ProblemMonitorServer) Check(ctx context.Context, req *pb.HealthCheckReq
 		Status:  pb.HealthCheckResponse_NOT_SERVING,
 		Message: "Server is not serving requests",
 	}, nil
+}
+
+// unaryLoggingInterceptor provides request logging and tracking similar to Kubernetes patterns
+func (s *ProblemMonitorServer) unaryLoggingInterceptor(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+	reqID := atomic.AddInt64(&requestID, 1)
+	logger := klog.FromContext(ctx)
+	logger = klog.LoggerWithValues(logger, "requestID", reqID, "method", info.FullMethod)
+	ctx = klog.NewContext(ctx, logger)
+	
+	start := time.Now()
+	logger.V(4).Info("handling grpc request", "request", req)
+	
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error(fmt.Errorf("grpc request panicked"), "grpc request panicked", "panic", r, "request", req)
+			panic(r)
+		}
+	}()
+	
+	resp, err := handler(ctx, req)
+	duration := time.Since(start)
+	
+	if err != nil {
+		logger.Error(err, "grpc request failed", "duration", duration)
+	} else {
+		logger.V(4).Info("grpc request succeeded", "response", resp, "duration", duration)
+	}
+	
+	return resp, err
+}
+
+// streamLoggingInterceptor provides stream logging similar to Kubernetes patterns  
+func (s *ProblemMonitorServer) streamLoggingInterceptor(srv interface{}, stream grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+	reqID := atomic.AddInt64(&requestID, 1)
+	ctx := stream.Context()
+	logger := klog.FromContext(ctx)
+	logger = klog.LoggerWithValues(logger, "requestID", reqID, "method", info.FullMethod)
+	ctx = klog.NewContext(ctx, logger)
+	
+	// Create a wrapped stream with the enhanced context
+	wrappedStream := &logStream{
+		ServerStream: stream,
+		ctx:          ctx,
+		logger:       logger,
+	}
+	
+	logger.V(4).Info("handling grpc stream")
+	start := time.Now()
+	
+	err := handler(srv, wrappedStream)
+	duration := time.Since(start)
+	
+	if err != nil {
+		logger.Error(err, "grpc stream failed", "duration", duration)
+	} else {
+		logger.V(4).Info("grpc stream succeeded", "duration", duration)
+	}
+	
+	return err
+}
+
+// logStream wraps grpc.ServerStream to provide enhanced context
+type logStream struct {
+	grpc.ServerStream
+	ctx    context.Context
+	logger klog.Logger
+}
+
+func (ls *logStream) Context() context.Context {
+	return ls.ctx
+}
+
+func (ls *logStream) SendMsg(m interface{}) error {
+	ls.logger.V(5).Info("sending stream message", "message", m)
+	err := ls.ServerStream.SendMsg(m)
+	if err != nil {
+		ls.logger.Error(err, "failed to send stream message")
+	} else {
+		ls.logger.V(5).Info("stream message sent successfully")
+	}
+	return err
 }
